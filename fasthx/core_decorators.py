@@ -6,9 +6,84 @@ from typing import Coroutine
 from fastapi import HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse
 
-from .dependencies import DependsHXRequest
 from .typing import HTMLRenderer, MaybeAsyncFunc, P, T
 from .utils import append_to_signature, execute_maybe_sync_func, get_response
+
+
+def xh(
+    render: HTMLRenderer[T],
+    *,
+    no_data: bool = False,
+    render_error: HTMLRenderer[Exception] | None = None,
+) -> Callable[[MaybeAsyncFunc[P, T]], Callable[P, Coroutine[None, None, T | Response]]]:
+    """
+    Decorator that converts a FastAPI route's return value into HTML unless the Accept header is JSON.
+    todo docstring
+    """
+
+    def decorator(func: MaybeAsyncFunc[P, T]) -> Callable[P, Coroutine[None, None, T | Response]]:
+        # Allow page routes to still have their own Request object defined.
+        sig = inspect.signature(func)
+        append_signature = True
+        for idx, parameter in enumerate(sig.parameters.values()):
+            if parameter.annotation == Request:
+                append_signature = False
+                break
+
+        @wraps(func)  # type: ignore[arg-type]
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T | Response:
+            if append_signature:
+                request: Request = kwargs.pop("__xh_request")
+            else:
+                request: Request = kwargs.get(parameter.name, args[idx] if idx < len(args) else None)
+            json_request = request.headers.get("Accept") == "application/json"
+
+            if no_data and json_request:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "This route can not process JSON requests.")
+
+            try:
+                result = await execute_maybe_sync_func(func, *args, **kwargs)
+                renderer = render
+            except Exception as e:
+                # Reraise if not HX request, because the checks later don't differentiate between
+                # error and non-error result objects.
+                # if render_error is None or __hx_request is None:
+                #     raise e
+
+                # result = e  # type: ignore[assignment]
+                # renderer = render_error  # type: ignore[assignment]
+                # todo error handling
+                raise e
+
+            if json_request or isinstance(result, Response):
+                return result
+
+            response = get_response(kwargs)
+            rendered = await execute_maybe_sync_func(renderer, result, context=kwargs, request=request)
+
+            return (
+                HTMLResponse(
+                    rendered,
+                    # The default status code of the FastAPI Response dependency is None
+                    # (not allowed by the typing but required for FastAPI).
+                    status_code=getattr(response, "status_code", 200) or 200,
+                    headers=getattr(response, "headers", None),
+                    background=getattr(response, "background", None),
+                )
+                if isinstance(rendered, str)
+                else rendered
+            )
+
+        return append_to_signature(
+            wrapper,  # type: ignore[arg-type]
+            inspect.Parameter(
+                "__xh_request",
+                inspect.Parameter.KEYWORD_ONLY,
+                annotation=Request,
+            ),
+        ) if append_signature else wrapper
+
+    return decorator
 
 
 def hx(
@@ -32,11 +107,23 @@ def hx(
     """
 
     def decorator(func: MaybeAsyncFunc[P, T]) -> Callable[P, Coroutine[None, None, T | Response]]:
+        # Allow page routes to still have their own Request object defined.
+        sig = inspect.signature(func)
+        append_signature = True
+        for idx, parameter in enumerate(sig.parameters.values()):
+            if parameter.annotation == Request:
+                append_signature = False
+                break
+
         @wraps(func)  # type: ignore[arg-type]
-        async def wrapper(
-            *args: P.args, __hx_request: DependsHXRequest, **kwargs: P.kwargs
-        ) -> T | Response:
-            if no_data and __hx_request is None:
+        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T | Response:
+            if append_signature:
+                request: Request = kwargs.pop("request")
+            else:
+                request: Request = kwargs.get(parameter.name, args[idx] if idx < len(args) else None)
+            hx_request = request.headers.get("HX-Request") == "true"
+
+            if no_data and hx_request:
                 raise HTTPException(
                     status.HTTP_400_BAD_REQUEST, "This route can only process HTMX requests."
                 )
@@ -47,17 +134,17 @@ def hx(
             except Exception as e:
                 # Reraise if not HX request, because the checks later don't differentiate between
                 # error and non-error result objects.
-                if render_error is None or __hx_request is None:
+                if render_error is None or request is None:
                     raise e
 
                 result = e  # type: ignore[assignment]
                 renderer = render_error  # type: ignore[assignment]
 
-            if __hx_request is None or isinstance(result, Response):
+            if hx_request or isinstance(result, Response):
                 return result
 
             response = get_response(kwargs)
-            rendered = await execute_maybe_sync_func(renderer, result, context=kwargs, request=__hx_request)
+            rendered = await execute_maybe_sync_func(renderer, result, context=kwargs, request=request)
 
             return (
                 HTMLResponse(
@@ -77,9 +164,9 @@ def hx(
             inspect.Parameter(
                 "__hx_request",
                 inspect.Parameter.KEYWORD_ONLY,
-                annotation=DependsHXRequest,
+                annotation=Request,
             ),
-        )
+        ) if append_signature else wrapper
 
     return decorator
 
@@ -125,9 +212,7 @@ def page(
                 renderer = render_error  # type: ignore[assignment]
 
             response = get_response(kwargs)
-            rendered = await execute_maybe_sync_func(
-                renderer, result, context=kwargs, request=request
-            )
+            rendered = await execute_maybe_sync_func(renderer, result, context=kwargs, request=request)
             return (
                 HTMLResponse(
                     rendered,

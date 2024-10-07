@@ -6,7 +6,7 @@ from typing import Any, Coroutine
 from fastapi import Request, Response
 from fastapi.templating import Jinja2Templates
 
-from .core_decorators import hx, page
+from .core_decorators import xh, hx, page
 from .typing import (
     ComponentSelector,
     HTMLRenderer,
@@ -280,6 +280,31 @@ class Jinja:
     Note that if this property is `True`, then the `hx()` decorator's `no_data` argument
     will have no effect.
     """
+
+    def xh(
+        self,
+        template: ComponentSelector[str],
+        *,
+        error_template: ComponentSelector[str] | None = None,
+        no_data: bool = False,
+        make_context: JinjaContextFactory | None = None,
+        prefix: str | None = None,
+    ):
+        """
+        Decorator that reverses the defaults from hx: Only send JSON if the accept header is JSON.
+        Otherwise, it sends back the template rendered as if it was the hx decorator.
+        """
+        if make_context is None:
+            # No route-specific override.
+            make_context = self.make_context
+        return xh(
+            self._make_render_function(template, make_context=make_context, prefix=prefix),
+            render_error=None
+            if error_template is None
+            else self._make_render_function(error_template, make_context=make_context, prefix=prefix),
+            no_data=self.no_data or no_data,
+        )
+
 
     def hx(
         self,
